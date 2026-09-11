@@ -840,6 +840,31 @@ class TestModels(unittest.TestCase):
         official["model.visual.pos_embed.weight"] = mx.zeros((2, 2))
         check(official)
 
+    def test_qwen4_exp_ngram_constants_are_checked(self):
+        """The n-gram hash constants are rebuilt from the config (the seed is
+        not in config.json), and the checkpoint carries the reference's copies:
+        a rebuild that disagrees must fail loudly at load, not read the wrong
+        rows of a 51B-parameter table in silence."""
+        from mlx_lm.models import qwen4_exp
+
+        model = qwen4_exp.Model(self._qwen4_exp_args())
+        table = model.language_model.model.layers[1].ple.ple_embedding
+        key = "language_model.model.layers.1.ple.ple_embedding.layer_multipliers"
+        weights = dict(tree_flatten(model.parameters()))
+        self.assertTrue(mx.array_equal(weights[key], table._mults))
+        model.sanitize(dict(weights))  # matching constants pass
+
+        wrong = qwen4_exp.Model(
+            qwen4_exp.ModelArgs(
+                model_type="qwen4_exp",
+                text_config={**self._qwen4_exp_args().text_config, "seed": 0},
+            )
+        )
+        bad = dict(tree_flatten(wrong.parameters()))
+        self.assertFalse(mx.array_equal(bad[key], weights[key]))
+        with self.assertRaises(ValueError):
+            model.sanitize(bad)
+
     def test_qwen4_exp(self):
         from mlx_lm.models import qwen4_exp
 
