@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import re
 import unittest
 from unittest import mock
 
@@ -711,10 +712,11 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
-    def test_qwen4_exp(self):
+    @staticmethod
+    def _qwen4_exp_args():
         from mlx_lm.models import qwen4_exp
 
-        args = qwen4_exp.ModelArgs(
+        return qwen4_exp.ModelArgs(
             model_type="qwen4_exp",
             text_config=dict(
                 hidden_size=64,
@@ -754,6 +756,94 @@ class TestModels(unittest.TestCase):
                 },
             ),
         )
+
+    def test_qwen4_exp_sanitize_layouts(self):
+        """Every checkpoint layout in the wild must land on the same weights.
+
+        The reference keeps zero-centered RMSNorm gains and adds 1 at runtime;
+        this port folds the 1 into the weights in ``sanitize``. Layouts: the
+        official checkpoint (``model.language_model.`` prefix, fused experts,
+        torch conv1d layout, raw gains), mlx-vlm conversions such as
+        mlx-community/Qwen3.8-Flash-Next-4bit (``language_model.model.``,
+        list-style ``shards.N`` PLE names, raw gains, a vision tower), the
+        early Vontra quant (this tree, ``shard_N``, folded gains) and the flat
+        ``model.`` layout earlier revisions of this port wrote. Each must
+        reproduce the source logits, and sanitize must be idempotent on its
+        own output — that is what protects a converted checkpoint from a
+        second fold at load.
+        """
+        from mlx_lm.models import qwen4_exp
+
+        args = self._qwen4_exp_args()
+        mx.random.seed(0)
+        source = qwen4_exp.Model(args)
+        # Random gains: on the default ones a missing or doubled fold is invisible.
+        params = {
+            k: (
+                v + 0.1 * mx.random.normal(v.shape)
+                if k.endswith(source._FOLD_ONE)
+                else v
+            )
+            for k, v in tree_flatten(source.parameters())
+        }
+        source.load_weights(list(params.items()))
+        inputs = mx.array([list(range(2, 12))])
+        expected = source(inputs)
+
+        def check(weights):
+            model = qwen4_exp.Model(args)
+            first = model.sanitize(weights)
+            model.load_weights(list(first.items()))
+            self.assertTrue(mx.allclose(model(inputs), expected, atol=1e-5))
+            second = model.sanitize(dict(first))
+            self.assertEqual(set(second), set(first))
+            for k in first:
+                self.assertTrue(mx.array_equal(first[k], second[k]), k)
+
+        def raw_gains(weights):
+            return {
+                k: v - 1.0 if k.endswith(source._FOLD_ONE) else v
+                for k, v in weights.items()
+            }
+
+        # This port's own layout, as `mlx_lm convert` writes it; Vontra is the same.
+        check(dict(params))
+
+        # mlx-vlm: list-style shard names, raw gains, vision tower alongside.
+        mlx_vlm = {
+            re.sub(r"\.shard_(\d+)\.", r".shards.\1.", k): v
+            for k, v in raw_gains(params).items()
+        }
+        mlx_vlm["vision_tower.patch_embed.proj.weight"] = mx.zeros((2, 2))
+        check(mlx_vlm)
+
+        # Flat layout of earlier revisions of this port: folded, no prefix.
+        check({k[len("language_model.") :]: v for k, v in params.items()})
+
+        # Official checkpoint: HF prefix, fused experts, torch conv, raw gains.
+        official = {}
+        for key, v in raw_gains(params).items():
+            k = key.replace("language_model.model.", "model.language_model.", 1)
+            k = k.replace("language_model.lm_head.", "lm_head.", 1)
+            if k.endswith("conv1d.weight"):
+                v = v.transpose(0, 2, 1)
+            if k.endswith("switch_mlp.up_proj.weight"):
+                continue
+            if k.endswith("switch_mlp.gate_proj.weight"):
+                up = params[key.replace("gate_proj", "up_proj")]
+                k = k.replace("switch_mlp.gate_proj.weight", "experts.gate_up_proj")
+                v = mx.concatenate([v, up], axis=-2)
+            elif k.endswith("switch_mlp.down_proj.weight"):
+                k = k.replace("switch_mlp.down_proj.weight", "experts.down_proj")
+            official[k] = v
+        official["mtp.layers.0.mlp.gate.weight"] = mx.zeros((2, 2))
+        official["model.visual.pos_embed.weight"] = mx.zeros((2, 2))
+        check(official)
+
+    def test_qwen4_exp(self):
+        from mlx_lm.models import qwen4_exp
+
+        args = self._qwen4_exp_args()
         model = qwen4_exp.Model(args)
         self.model_test_runner(
             model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers

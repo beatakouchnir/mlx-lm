@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
@@ -1053,26 +1054,47 @@ class _LayerCache(ArraysCache):
         super().prepare(lengths=lengths, **kwargs)
 
 
+class LanguageModel(nn.Module):
+    """Text model and head under the ``language_model`` name.
+
+    That is the tree mlx-vlm conversions are keyed by (``language_model.model.
+    layers...``, ``language_model.lm_head``) and the one mlx-lm's other
+    VLM-derived families use (qwen3_5, qwen3_vl_moe, gemma3, ...). Matching it
+    makes checkpoint keys and the per-module ``quantization`` entries of the
+    config line up with module paths without any renaming at load.
+    """
+
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.args = args
+        self.model = Qwen4ExpModel(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(self, inputs: mx.array, cache=None, input_embeddings=None):
+        out = self.model(inputs, cache, input_embeddings)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        return self.lm_head(out)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen4ExpModel(args.text)
-        if not args.text.tie_word_embeddings:
-            self.lm_head = nn.Linear(
-                args.text.hidden_size, args.text.vocab_size, bias=False
-            )
+        self.language_model = LanguageModel(args.text)
 
     def __call__(self, inputs: mx.array, cache=None, input_embeddings=None):
-        out = self.model(inputs, cache, input_embeddings)
-        if self.args.text.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+        return self.language_model(inputs, cache, input_embeddings)
+
+    @property
+    def model(self):
+        return self.language_model.model
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.language_model.model.layers
 
     def make_cache(self):
         caches = []
@@ -1087,18 +1109,37 @@ class Model(nn.Module):
     # Norms scaled by `1 + w` in the reference (RMSNorm above); `linear_attn.norm` is
     # RMSNormGated and scales by `w` alone, so it must stay out of this list.
     _FOLD_ONE = (
-        "q_layernorm.weight", "k_layernorm.weight",
-        "q_norm.weight", "k_norm.weight",
+        "q_layernorm.weight",
+        "k_layernorm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
         "hc_norm.weight",
-        "norm_key.weight", "norm_query.weight", "norm_conv.weight",
+        "norm_key.weight",
+        "norm_query.weight",
+        "norm_conv.weight",
     )
 
+    # mlx-vlm keeps the PLE shards in a list, so its conversions name them
+    # `shards.N` where the reference and this port say `shard_N`.
+    _MLX_VLM_SHARD = re.compile(r"\.ngram_embedding\.shards\.(\d+)(?=\.)")
+
     def sanitize(self, weights):
-        # Fold the reference's `1 +` into the weight here instead of at every call. Gated on
-        # the HF layout, because sanitize also runs on load: a checkpoint converted by this
-        # file comes back as `model.*`, matches nothing below, and must not be folded twice.
-        # Checkpoints from other MLX converters already carry the folded value.
-        fold = any(k.startswith("model.language_model.") for k in weights)
+        # Fold the reference's `1 +` into the weight here instead of at every call.
+        # Two checkpoint layouts still carry the zero-centered gains, and each is
+        # recognized by a structural signal (the same rule qwen3_5.py uses, no
+        # value heuristics): the official checkpoint has torch-layout conv1d
+        # weights, (C, 1, K); an mlx-vlm conversion has `shards.N` PLE names —
+        # mlx-vlm stores the raw gains and adds the 1 at runtime, so e.g.
+        # mlx-community/Qwen3.8-Flash-Next-4bit needs the fold as much as the
+        # official weights do. Both signals are consumed by the transpose and the
+        # rename below, which is what keeps a second pass a no-op: a checkpoint
+        # written by this port (mlx conv layout, `shard_N`, folded gains) matches
+        # neither, and neither does the early Vontra quant, which folded at
+        # conversion.
+        fold = any(
+            k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1
+            for k, v in weights.items()
+        ) or any(self._MLX_VLM_SHARD.search(k) for k in weights)
 
         out = {}
         for k, v in weights.items():
@@ -1110,13 +1151,16 @@ class Model(nn.Module):
                 continue
 
             # Prefix. The official checkpoint nests the text model under
-            # `model.language_model.` while already-converted MLX checkpoints use
-            # the flat `language_model.` form; both must land on `model.`.
-            # `lm_head.weight` sits at the top level upstream and is left alone.
+            # `model.language_model.` with `lm_head` at the top level; mlx-vlm
+            # conversions use `language_model.model.` / `language_model.lm_head`,
+            # which is this module tree. Conversions made by earlier revisions of
+            # this port carry a flat `model.` / `lm_head` layout.
             if k.startswith("model.language_model."):
-                k = "model." + k[len("model.language_model.") :]
-            elif k.startswith("language_model."):
-                k = k[len("language_model.") :]
+                k = "language_model.model." + k[len("model.language_model.") :]
+            elif not k.startswith("language_model."):
+                k = "language_model." + k
+
+            k = self._MLX_VLM_SHARD.sub(r".ngram_embedding.shard_\1", k)
 
             # Experts. Upstream stacks them as `experts.gate_up_proj`
             # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`
